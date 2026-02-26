@@ -1,102 +1,156 @@
 const http = require("http");
 const WebSocket = require("ws");
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = process.env.PORT || 8080;
 
 const server = http.createServer((req, res) => {
-  if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    return res.end("ok");
-  }
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("flip-chat-server ok");
+  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+  res.end("FlipChat WS server is running\n");
 });
 
 const wss = new WebSocket.Server({ server });
 
-const clientsByUser = new Map();
+/**
+ * username -> { ws, userData }
+ */
+const clients = new Map();
 
-function send(ws, obj) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+/**
+ * пользователи, которых сервер “видел” хоть раз (пока сервер не перезапустится)
+ */
+const seenUsers = new Map(); // username -> userData
+
+function safeSend(ws, obj) {
+  try {
+    ws.send(JSON.stringify(obj));
+  } catch {}
 }
 
-function broadcast(obj, skip = null) {
-  const msg = JSON.stringify(obj);
-  for (const [uid, c] of clientsByUser.entries()) {
-    if (skip && uid === skip) continue;
-    if (c.ws.readyState === WebSocket.OPEN) c.ws.send(msg);
+function broadcast(obj) {
+  for (const { ws } of clients.values()) {
+    if (ws.readyState === WebSocket.OPEN) safeSend(ws, obj);
   }
 }
 
+function makeDirectory() {
+  const online = new Set(clients.keys());
+  const out = [];
+  for (const [userId, userData] of seenUsers.entries()) {
+    out.push({
+      userId,
+      display: userData?.display || userId,
+      avatar: userData?.avatar || null,
+      online: online.has(userId),
+    });
+  }
+  // на всякий — если кто-то онлайн, но ещё не в seenUsers
+  for (const userId of online) {
+    if (!seenUsers.has(userId)) {
+      out.push({ userId, display: userId, avatar: null, online: true });
+    }
+  }
+  return out;
+}
+
+function sendOnlineUsers(ws) {
+  const users = [];
+  for (const [userId, entry] of clients.entries()) {
+    users.push({ userId, ...(entry.userData || {}) });
+  }
+  safeSend(ws, { type: "online_users", users });
+}
+
+function broadcastDirectory() {
+  broadcast({ type: "user_directory", users: makeDirectory() });
+}
+
 wss.on("connection", (ws) => {
-  let userId = null;
+  let username = null;
 
   ws.on("message", (raw) => {
     let data;
-    try { data = JSON.parse(raw.toString()); }
-    catch { return send(ws, { type: "error", message: "Invalid JSON" }); }
-
-    if (data.type === "register") {
-      const uid = String(data.userId || "").trim();
-      if (!uid) return send(ws, { type: "error", message: "userId пустой" });
-
-      userId = uid;
-      clientsByUser.set(uid, { ws, userData: data.userData || {} });
-
-      const users = [];
-      for (const [ouid, oc] of clientsByUser.entries()) {
-        if (ouid === uid) continue;
-        users.push({ userId: ouid, userData: oc.userData || {} });
-      }
-      send(ws, { type: "online_users", users });
-      broadcast({ type: "user_online", userId: uid, userData: data.userData || {} }, uid);
+    try {
+      data = JSON.parse(raw.toString());
+    } catch {
       return;
     }
 
-    if (!userId) return;
+    // Клиент должен прислать hello после логина:
+    // {type:"hello", userId:"name", userData:{display, avatar}}
+    if (data.type === "hello") {
+      username = String(data.userId || "").trim();
+      if (!username) return;
 
+      const userData = data.userData || {};
+      clients.set(username, { ws, userData });
+
+      // запоминаем в каталоге
+      const prev = seenUsers.get(username) || {};
+      seenUsers.set(username, { ...prev, ...userData, display: userData.display || prev.display || username });
+
+      // всем: кто онлайн
+      broadcast({ type: "user_online", userId: username, userData });
+      // этому клиенту: список онлайн
+      sendOnlineUsers(ws);
+      // всем: каталог (онлайн+виденные)
+      broadcastDirectory();
+      return;
+    }
+
+    // запрос каталога вручную
+    if (data.type === "get_directory") {
+      safeSend(ws, { type: "user_directory", users: makeDirectory() });
+      return;
+    }
+
+    // приватные сообщения
     if (data.type === "private_message") {
+      const from = String(data.from || "").trim();
       const to = String(data.to || "").trim();
-      const target = clientsByUser.get(to);
-      const payload = {
-        type: "private_message",
-        from: userId,
-        to,
-        text: data.text || "",
-        messageId: data.messageId || null,
-        timestamp: new Date().toISOString(),
-      };
-      if (target && target.ws.readyState === WebSocket.OPEN) send(target.ws, payload);
-      else send(ws, { type: "error", message: `Пользователь ${to} оффлайн` });
+      const text = String(data.text || "");
+
+      if (!from || !to || !text) return;
+
+      const target = clients.get(to);
+      if (target && target.ws.readyState === WebSocket.OPEN) {
+        safeSend(target.ws, {
+          type: "private_message",
+          from,
+          to,
+          text,
+          timestamp: data.timestamp || new Date().toISOString(),
+          messageId: data.messageId || null,
+        });
+      } else {
+        // если оффлайн — просто скажем отправителю (сообщение не доставлено)
+        safeSend(ws, {
+          type: "error",
+          message: `Пользователь ${to} сейчас оффлайн (сообщение не доставлено).`,
+        });
+      }
       return;
     }
 
+    // typing
     if (data.type === "typing") {
       const to = String(data.to || "").trim();
-      const target = clientsByUser.get(to);
+      const target = clients.get(to);
       if (target && target.ws.readyState === WebSocket.OPEN) {
-        send(target.ws, {
-          type: "typing",
-          from: userId,
-          to,
-          isTyping: !!data.isTyping,
-          chatId: data.chatId || null
-        });
+        safeSend(target.ws, data);
       }
       return;
     }
   });
 
   ws.on("close", () => {
-    if (!userId) return;
-    const cur = clientsByUser.get(userId);
-    if (cur && cur.ws === ws) {
-      clientsByUser.delete(userId);
-      broadcast({ type: "user_offline", userId }, userId);
+    if (username && clients.has(username)) {
+      clients.delete(username);
+      broadcast({ type: "user_offline", userId: username });
+      broadcastDirectory();
     }
   });
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log("Server running on port", PORT);
+server.listen(PORT, () => {
+  console.log("WebSocket server running on port", PORT);
 });
