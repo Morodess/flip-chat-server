@@ -1,156 +1,188 @@
 const http = require("http");
 const WebSocket = require("ws");
 
-const PORT = process.env.PORT || 8080;
+const PORT = Number(process.env.PORT || 3000);
 
+// HTTP нужен Railway для healthcheck
 const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    return res.end("ok");
+  }
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-  res.end("FlipChat WS server is running\n");
+  res.end("flip-chat-server ok");
 });
 
 const wss = new WebSocket.Server({ server });
 
 /**
- * username -> { ws, userData }
+ * online clients: userId -> { ws, userData }
  */
-const clients = new Map();
+const online = new Map();
 
 /**
- * пользователи, которых сервер “видел” хоть раз (пока сервер не перезапустится)
+ * directory of seen users (persists while server is running)
+ * userId -> userData
  */
-const seenUsers = new Map(); // username -> userData
+const directory = new Map();
 
 function safeSend(ws, obj) {
   try {
-    ws.send(JSON.stringify(obj));
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    }
   } catch {}
 }
 
-function broadcast(obj) {
-  for (const { ws } of clients.values()) {
-    if (ws.readyState === WebSocket.OPEN) safeSend(ws, obj);
+function broadcast(obj, skipUserId = null) {
+  const msg = JSON.stringify(obj);
+  for (const [uid, c] of online.entries()) {
+    if (skipUserId && uid === skipUserId) continue;
+    if (c.ws.readyState === WebSocket.OPEN) c.ws.send(msg);
   }
 }
 
-function makeDirectory() {
-  const online = new Set(clients.keys());
-  const out = [];
-  for (const [userId, userData] of seenUsers.entries()) {
-    out.push({
+function getDirectoryPayload() {
+  const arr = [];
+  for (const [userId, userData] of directory.entries()) {
+    arr.push({
       userId,
-      display: userData?.display || userId,
-      avatar: userData?.avatar || null,
+      userData,
       online: online.has(userId),
     });
   }
-  // на всякий — если кто-то онлайн, но ещё не в seenUsers
-  for (const userId of online) {
-    if (!seenUsers.has(userId)) {
-      out.push({ userId, display: userId, avatar: null, online: true });
+  // на всякий случай добавим всех онлайн, если их вдруг нет в directory
+  for (const [userId, c] of online.entries()) {
+    if (!directory.has(userId)) {
+      arr.push({ userId, userData: c.userData || {}, online: true });
     }
   }
-  return out;
+  return arr;
 }
 
-function sendOnlineUsers(ws) {
+function sendOnlineUsers(ws, forUserId) {
   const users = [];
-  for (const [userId, entry] of clients.entries()) {
-    users.push({ userId, ...(entry.userData || {}) });
+  for (const [userId, c] of online.entries()) {
+    if (forUserId && userId === forUserId) continue;
+    users.push({ userId, userData: c.userData || {} });
   }
   safeSend(ws, { type: "online_users", users });
 }
 
 function broadcastDirectory() {
-  broadcast({ type: "user_directory", users: makeDirectory() });
+  broadcast({ type: "user_directory", users: getDirectoryPayload() });
 }
 
 wss.on("connection", (ws) => {
-  let username = null;
+  let userId = null;
 
   ws.on("message", (raw) => {
     let data;
     try {
       data = JSON.parse(raw.toString());
     } catch {
-      return;
+      return safeSend(ws, { type: "error", message: "Неверный JSON" });
     }
 
-    // Клиент должен прислать hello после логина:
-    // {type:"hello", userId:"name", userData:{display, avatar}}
-    if (data.type === "hello") {
-      username = String(data.userId || "").trim();
-      if (!username) return;
+    const type = data.type;
 
+    // Клиент регистрируется
+    if (type === "register") {
+      const uid = String(data.userId || "").trim().slice(0, 64);
       const userData = data.userData || {};
-      clients.set(username, { ws, userData });
 
-      // запоминаем в каталоге
-      const prev = seenUsers.get(username) || {};
-      seenUsers.set(username, { ...prev, ...userData, display: userData.display || prev.display || username });
+      if (!uid) return safeSend(ws, { type: "error", message: "userId пустой" });
 
-      // всем: кто онлайн
-      broadcast({ type: "user_online", userId: username, userData });
-      // этому клиенту: список онлайн
-      sendOnlineUsers(ws);
-      // всем: каталог (онлайн+виденные)
+      userId = uid;
+
+      // Если этот userId уже онлайн — выбиваем старое соединение
+      const old = online.get(uid);
+      if (old && old.ws !== ws) {
+        try { old.ws.close(); } catch {}
+      }
+
+      online.set(uid, { ws, userData });
+
+      // сохраняем/обновляем каталог
+      const prev = directory.get(uid) || {};
+      directory.set(uid, { ...prev, ...userData });
+
+      // отправляем этому клиенту: кто онлайн
+      sendOnlineUsers(ws, uid);
+
+      // всем: этот юзер онлайн
+      broadcast({ type: "user_online", userId: uid, userData }, uid);
+
+      // всем: обновлённый каталог
       broadcastDirectory();
       return;
     }
 
-    // запрос каталога вручную
-    if (data.type === "get_directory") {
-      safeSend(ws, { type: "user_directory", users: makeDirectory() });
+    // запрос каталога
+    if (type === "get_directory") {
+      safeSend(ws, { type: "user_directory", users: getDirectoryPayload() });
       return;
     }
 
-    // приватные сообщения
-    if (data.type === "private_message") {
-      const from = String(data.from || "").trim();
-      const to = String(data.to || "").trim();
-      const text = String(data.text || "");
+    // все остальные сообщения требуют register
+    if (!userId) {
+      return safeSend(ws, { type: "error", message: "Сначала register" });
+    }
 
-      if (!from || !to || !text) return;
+    // приватное сообщение
+    if (type === "private_message") {
+      const to = String(data.to || "").trim().slice(0, 64);
+      if (!to) return safeSend(ws, { type: "error", message: "Нет поля to" });
 
-      const target = clients.get(to);
+      const payload = {
+        type: "private_message",
+        from: userId,
+        to,
+        text: data.text || "",
+        messageId: data.messageId || null,
+        timestamp: data.timestamp || new Date().toISOString(),
+      };
+
+      const target = online.get(to);
       if (target && target.ws.readyState === WebSocket.OPEN) {
-        safeSend(target.ws, {
-          type: "private_message",
-          from,
-          to,
-          text,
-          timestamp: data.timestamp || new Date().toISOString(),
-          messageId: data.messageId || null,
-        });
+        safeSend(target.ws, payload);
       } else {
-        // если оффлайн — просто скажем отправителю (сообщение не доставлено)
-        safeSend(ws, {
-          type: "error",
-          message: `Пользователь ${to} сейчас оффлайн (сообщение не доставлено).`,
-        });
+        safeSend(ws, { type: "error", message: `Пользователь ${to} оффлайн` });
       }
       return;
     }
 
     // typing
-    if (data.type === "typing") {
-      const to = String(data.to || "").trim();
-      const target = clients.get(to);
+    if (type === "typing") {
+      const to = String(data.to || "").trim().slice(0, 64);
+      const target = online.get(to);
       if (target && target.ws.readyState === WebSocket.OPEN) {
-        safeSend(target.ws, data);
+        safeSend(target.ws, {
+          type: "typing",
+          from: userId,
+          to,
+          isTyping: !!data.isTyping,
+          chatId: data.chatId || null,
+        });
       }
       return;
     }
+
+    safeSend(ws, { type: "error", message: `Неизвестный type: ${type}` });
   });
 
   ws.on("close", () => {
-    if (username && clients.has(username)) {
-      clients.delete(username);
-      broadcast({ type: "user_offline", userId: username });
+    if (!userId) return;
+
+    const cur = online.get(userId);
+    if (cur && cur.ws === ws) {
+      online.delete(userId);
+      broadcast({ type: "user_offline", userId }, userId);
       broadcastDirectory();
     }
   });
 });
 
-server.listen(PORT, () => {
-  console.log("WebSocket server running on port", PORT);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log("Server running on port", PORT);
 });
