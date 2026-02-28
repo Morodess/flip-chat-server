@@ -1,329 +1,542 @@
+// FlipChat Server v2 (WebSocket + HTTP uploads + MySQL persistence)
+// Works on Railway. Exposes HTTP on PORT and upgrades to WS on same port.
+
 const http = require("http");
-const WebSocket = require("ws");
+const path = require("path");
+const fs = require("fs");
+const express = require("express");
+const cors = require("cors");
+const multer = require("multer");
+const { WebSocketServer } = require("ws");
 const mysql = require("mysql2/promise");
+const crypto = require("crypto");
 
-const ADMIN_USER = "morodess";
-const PORT = Number(process.env.PORT || 3000);
+const PORT = parseInt(process.env.PORT || "8080", 10);
 
-let db;
+// Railway MySQL vars (via Variable Reference)
+const DB_HOST = process.env.MYSQLHOST || process.env.MYSQL_HOST || "127.0.0.1";
+const DB_USER = process.env.MYSQLUSER || process.env.MYSQL_USER || "root";
+const DB_PASS = process.env.MYSQLPASSWORD || process.env.MYSQL_PASSWORD || "";
+const DB_NAME = process.env.MYSQLDATABASE || process.env.MYSQL_DATABASE || "flipchat";
+const DB_PORT = parseInt(process.env.MYSQLPORT || process.env.MYSQL_PORT || "3306", 10);
 
-// userId -> { ws, userData }
-const online = new Map();
+// Admins (comma-separated usernames, without @)
+const ADMIN_USERS = new Set(
+  (process.env.ADMIN_USERS || "morodess")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+);
 
-function nowIso() {
-  return new Date().toISOString();
-}
+// If set, server will reject non-https origins (optional)
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-function safeSend(ws, obj) {
-  try {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
-  } catch {}
-}
+function nowMs() { return Date.now(); }
+function sha256(s) { return crypto.createHash("sha256").update(String(s)).digest("hex"); }
+function newToken() { return crypto.randomBytes(32).toString("hex"); }
+function normUser(u) { return String(u || "").trim().replace(/^@+/, "").toLowerCase(); }
 
-function broadcast(obj, skipUserId = null) {
-  const msg = JSON.stringify(obj);
-  for (const [uid, c] of online.entries()) {
-    if (skipUserId && uid === skipUserId) continue;
-    if (c.ws.readyState === WebSocket.OPEN) c.ws.send(msg);
-  }
-}
+let pool;
 
 async function initDB() {
-  const host = process.env.MYSQLHOST;
-  const port = Number(process.env.MYSQLPORT || 3306);
-  const user = process.env.MYSQLUSER;
-  const password = process.env.MYSQLPASSWORD;
-  const database = process.env.MYSQLDATABASE;
+  pool = await mysql.createPool({
+    host: DB_HOST,
+    user: DB_USER,
+    password: DB_PASS,
+    database: DB_NAME,
+    port: DB_PORT,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    charset: "utf8mb4",
+  });
 
-  const missing = [];
-  if (!host) missing.push("MYSQLHOST");
-  if (!process.env.MYSQLPORT) missing.push("MYSQLPORT");
-  if (!user) missing.push("MYSQLUSER");
-  if (password === undefined) missing.push("MYSQLPASSWORD");
-  if (!database) missing.push("MYSQLDATABASE");
-  if (missing.length) throw new Error("Missing MySQL env vars in flip-chat-server: " + missing.join(", "));
-
-  db = await mysql.createConnection({ host, port, user, password, database });
-
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS users (
-      userId VARCHAR(64) PRIMARY KEY,
-      display VARCHAR(255) NULL,
-      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      lastSeen DATETIME NULL
-    )
-  `);
-
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS messages (
-      id BIGINT PRIMARY KEY AUTO_INCREMENT,
-      sender VARCHAR(64) NOT NULL,
-      recipient VARCHAR(64) NOT NULL,
-      text TEXT NOT NULL,
-      ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      delivered TINYINT NOT NULL DEFAULT 0
-    )
-  `);
-
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS user_flags (
-      userId VARCHAR(64) PRIMARY KEY,
-      banned_until DATETIME NULL,
-      muted_until DATETIME NULL
-    )
-  `);
-
-  console.log("MySQL connected");
+  // Create tables if not exist
+  const schema = fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8");
+  for (const stmt of schema.split(/;\s*$/m)) {
+    const s = stmt.trim();
+    if (!s) continue;
+    await pool.query(s);
+  }
 }
 
-async function ensureUser(userId, display) {
-  await db.execute(
-    "INSERT INTO users (userId, display, lastSeen) VALUES (?, ?, NOW()) ON DUPLICATE KEY UPDATE display=COALESCE(VALUES(display), display), lastSeen=NOW()",
-    [userId, display || userId]
+async function q(sql, params = []) {
+  const [rows] = await pool.query(sql, params);
+  return rows;
+}
+
+async function getUserByUsername(username) {
+  const rows = await q("SELECT * FROM users WHERE username = ?", [username]);
+  return rows[0] || null;
+}
+
+async function getUserByToken(token) {
+  const rows = await q("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at > NOW()", [token]);
+  return rows[0] || null;
+}
+
+async function createSession(userId) {
+  const token = newToken();
+  // 30 days session
+  await q("INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 30 DAY))", [userId, token]);
+  return token;
+}
+
+async function deleteSessions(userId) {
+  await q("DELETE FROM sessions WHERE user_id=?", [userId]);
+}
+
+async function isMuted(userId) {
+  const rows = await q(
+    "SELECT * FROM sanctions WHERE user_id=? AND type='mute' AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY id DESC LIMIT 1",
+    [userId]
   );
+  return rows[0] || null;
 }
 
-async function getFlags(userId) {
-  const [rows] = await db.execute("SELECT banned_until, muted_until FROM user_flags WHERE userId=?", [userId]);
-  if (!rows.length) return { banned_until: null, muted_until: null };
-  return rows[0];
-}
-
-function isFutureDate(d) {
-  if (!d) return false;
-  return new Date(d).getTime() > Date.now();
-}
-
-async function getDirectory() {
-  const [rows] = await db.execute("SELECT userId, display FROM users ORDER BY userId ASC");
-  return rows.map(r => ({
-    userId: r.userId,
-    userData: { display: r.display || r.userId },
-    online: online.has(r.userId),
-  }));
-}
-
-async function deliverUndelivered(toUserId, ws) {
-  const [rows] = await db.execute(
-    "SELECT id, sender, recipient, text, ts FROM messages WHERE recipient=? AND delivered=0 ORDER BY id ASC LIMIT 200",
-    [toUserId]
+async function activeBan(userId) {
+  const rows = await q(
+    "SELECT * FROM sanctions WHERE user_id=? AND type='ban' AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY id DESC LIMIT 1",
+    [userId]
   );
-
-  for (const m of rows) {
-    safeSend(ws, {
-      type: "private_message",
-      from: m.sender,
-      to: m.recipient,
-      text: m.text,
-      messageId: String(m.id),
-      timestamp: new Date(m.ts).toISOString(),
-      offline: true,
-    });
-  }
-
-  if (rows.length) {
-    const lastId = rows[rows.length - 1].id;
-    await db.execute("UPDATE messages SET delivered=1 WHERE recipient=? AND delivered=0 AND id<=?", [toUserId, lastId]);
-  }
+  return rows[0] || null;
 }
 
-async function adminAction(from, ws, data) {
-  if (from !== ADMIN_USER) {
-    return safeSend(ws, { type: "error", message: "Нет прав" });
-  }
-  const action = String(data.action || "");
-  const target = String(data.target || "").trim().slice(0, 64);
-  const minutes = Number(data.minutes || 0);
-
-  if (!target) return safeSend(ws, { type: "error", message: "target пустой" });
-
-  if (action === "ban") {
-    const until = minutes > 0 ? new Date(Date.now() + minutes * 60_000) : new Date(Date.now() + 3650 * 24 * 60_000);
-    await db.execute(
-      "INSERT INTO user_flags (userId, banned_until, muted_until) VALUES (?, ?, NULL) ON DUPLICATE KEY UPDATE banned_until=?",
-      [target, until, until]
-    );
-    safeSend(ws, { type: "admin_ok", action, target, until: until.toISOString() });
-    const cur = online.get(target);
-    if (cur) { try { cur.ws.close(); } catch {} }
-    return;
-  }
-
-  if (action === "unban") {
-    await db.execute(
-      "INSERT INTO user_flags (userId, banned_until, muted_until) VALUES (?, NULL, NULL) ON DUPLICATE KEY UPDATE banned_until=NULL",
-      [target]
-    );
-    return safeSend(ws, { type: "admin_ok", action, target });
-  }
-
-  if (action === "mute") {
-    const until = minutes > 0 ? new Date(Date.now() + minutes * 60_000) : new Date(Date.now() + 60 * 60_000);
-    await db.execute(
-      "INSERT INTO user_flags (userId, banned_until, muted_until) VALUES (?, NULL, ?) ON DUPLICATE KEY UPDATE muted_until=?",
-      [target, until, until]
-    );
-    return safeSend(ws, { type: "admin_ok", action, target, until: until.toISOString() });
-  }
-
-  if (action === "unmute") {
-    await db.execute(
-      "INSERT INTO user_flags (userId, banned_until, muted_until) VALUES (?, NULL, NULL) ON DUPLICATE KEY UPDATE muted_until=NULL",
-      [target]
-    );
-    return safeSend(ws, { type: "admin_ok", action, target });
-  }
-
-  return safeSend(ws, { type: "error", message: "Неизвестная admin action" });
+async function listDirectory() {
+  const users = await q(
+    "SELECT id, username, display_name, email, email_public, avatar_url, prefix, created_at FROM users ORDER BY created_at ASC"
+  );
+  const channels = await q(
+    "SELECT id, name, owner_user_id, created_at FROM channels ORDER BY created_at ASC"
+  );
+  return { users, channels };
 }
 
-// HTTP healthcheck
-const server = http.createServer((req, res) => {
-  if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    return res.end("ok");
-  }
-  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-  res.end("flip-chat-server ok");
-});
+function safeUserPublic(u, online=false) {
+  return {
+    id: u.id,
+    username: u.username,
+    display: u.display_name || u.username,
+    email: u.email_public ? (u.email || null) : null,
+    emailPublic: !!u.email_public,
+    avatarUrl: u.avatar_url || null,
+    prefix: u.prefix || "",
+    online: !!online,
+    createdAt: u.created_at,
+  };
+}
 
-const wss = new WebSocket.Server({ server });
+function send(ws, obj) {
+  try { ws.send(JSON.stringify(obj)); } catch {}
+}
 
-wss.on("connection", (ws) => {
-  let userId = null;
-
-  ws.on("message", async (raw) => {
-    let data;
-    try { data = JSON.parse(raw.toString()); }
-    catch { return safeSend(ws, { type: "error", message: "Неверный JSON" }); }
-
-    // совместимость: если клиент вдруг шлёт hello
-    if (data.type === "hello") {
-      data = { type: "register", userId: data.userId, userData: data.userData || {} };
+function broadcast(clients, obj, exceptWs = null) {
+  const msg = JSON.stringify(obj);
+  for (const c of clients) {
+    if (c === exceptWs) continue;
+    if (c.readyState === 1) {
+      try { c.send(msg); } catch {}
     }
+  }
+}
 
-    if (data.type === "register") {
-      const uid = String(data.userId || "").trim().slice(0, 64);
-      const display = String(data.userData?.display || uid);
+function wsCloseWithBan(ws, reason, untilIso) {
+  send(ws, { type: "ban", reason: reason || "ban", until: untilIso || null });
+  try { ws.close(4003, "banned"); } catch {}
+}
 
-      if (!uid) return safeSend(ws, { type: "error", message: "userId пустой" });
+async function main() {
+  await initDB();
+  console.log("DB OK");
 
-      // ban check
-      const flags = await getFlags(uid);
-      if (isFutureDate(flags.banned_until)) {
-        safeSend(ws, { type: "error", message: "Вы забанены" });
-        try { ws.close(); } catch {}
+  const app = express();
+  app.use(cors({ origin: ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : true, credentials: true }));
+  app.use(express.json({ limit: "2mb" }));
+
+  // uploads
+  const uploadDir = path.join(__dirname, "uploads");
+  fs.mkdirSync(uploadDir, { recursive: true });
+
+  const storage = multer.diskStorage({
+    destination: (_, __, cb) => cb(null, uploadDir),
+    filename: (_, file, cb) => {
+      const ext = path.extname(file.originalname || "").slice(0, 10) || "";
+      cb(null, `${Date.now()}-${crypto.randomBytes(8).toString("hex")}${ext}`);
+    }
+  });
+
+  const upload = multer({
+    storage,
+    limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
+  });
+
+  app.use("/uploads", express.static(uploadDir, { maxAge: "7d" }));
+
+  app.get("/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
+
+  // Upload endpoints (avatar, voice)
+  app.post("/upload/avatar", upload.single("file"), async (req, res) => {
+    res.json({ ok: true, url: `/uploads/${req.file.filename}` });
+  });
+
+  app.post("/upload/voice", upload.single("file"), async (req, res) => {
+    res.json({ ok: true, url: `/uploads/${req.file.filename}` });
+  });
+
+  const server = http.createServer(app);
+
+  const wss = new WebSocketServer({ noServer: true });
+  const clients = new Set(); // ws objects
+
+  server.on("upgrade", (req, socket, head) => {
+    // Optional origin check
+    if (ALLOWED_ORIGINS.length) {
+      const origin = req.headers.origin || "";
+      if (!ALLOWED_ORIGINS.includes(origin)) {
+        socket.destroy();
         return;
       }
-
-      userId = uid;
-
-      // kick previous session
-      const old = online.get(uid);
-      if (old && old.ws !== ws) { try { old.ws.close(); } catch {} }
-
-      online.set(uid, { ws, userData: { display } });
-
-      await ensureUser(uid, display);
-
-      // этому клиенту: кто онлайн + каталог
-      const dir = await getDirectory();
-      safeSend(ws, { type: "user_directory", users: dir });
-
-      const onlineUsers = [];
-      for (const [ouid, oc] of online.entries()) {
-        if (ouid === uid) continue;
-        onlineUsers.push({ userId: ouid, userData: oc.userData || {} });
-      }
-      safeSend(ws, { type: "online_users", users: onlineUsers });
-
-      // всем остальным: он онлайн
-      broadcast({ type: "user_online", userId: uid, userData: { display } }, uid);
-
-      // доставить оффлайн сообщения
-      await deliverUndelivered(uid, ws);
-      return;
     }
-
-    if (data.type === "get_directory") {
-      const dir = await getDirectory();
-      return safeSend(ws, { type: "user_directory", users: dir });
-    }
-
-    if (!userId) return safeSend(ws, { type: "error", message: "Сначала register" });
-
-    // admin
-    if (data.type === "admin_action") {
-      return adminAction(userId, ws, data);
-    }
-
-    // mute check for sending
-    const flags = await getFlags(userId);
-    const muted = isFutureDate(flags.muted_until);
-
-    if (data.type === "private_message") {
-      if (muted) return safeSend(ws, { type: "error", message: "Вы замучены (mute)" });
-
-      const to = String(data.to || "").trim().slice(0, 64);
-      const text = String(data.text || "");
-      if (!to) return safeSend(ws, { type: "error", message: "Нет поля to" });
-      if (!text) return;
-
-      // сохраняем в БД ВСЕГДА
-      const [result] = await db.execute(
-        "INSERT INTO messages (sender, recipient, text, delivered) VALUES (?, ?, ?, ?)",
-        [userId, to, text, 0]
-      );
-      const msgId = String(result.insertId);
-
-      // если получатель онлайн — доставляем и помечаем delivered=1
-      const target = online.get(to);
-      const payload = {
-        type: "private_message",
-        from: userId,
-        to,
-        text,
-        messageId: msgId,
-        timestamp: nowIso(),
-      };
-
-      if (target && target.ws.readyState === WebSocket.OPEN) {
-        safeSend(target.ws, payload);
-        await db.execute("UPDATE messages SET delivered=1 WHERE id=?", [Number(msgId)]);
-      } else {
-        // сообщим отправителю, что ушло “в оффлайн”
-        safeSend(ws, { type: "info", message: `Пользователь ${to} оффлайн, доставим при входе.` });
-      }
-      return;
-    }
-
-    if (data.type === "typing") {
-      const to = String(data.to || "").trim().slice(0, 64);
-      const target = online.get(to);
-      if (target && target.ws.readyState === WebSocket.OPEN) {
-        safeSend(target.ws, { type: "typing", from: userId, to, isTyping: !!data.isTyping, chatId: data.chatId || null });
-      }
-      return;
-    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
   });
 
-  ws.on("close", async () => {
-    if (!userId) return;
+  // Online map: userId -> ws
+  const onlineByUserId = new Map();
 
-    const cur = online.get(userId);
-    if (cur && cur.ws === ws) online.delete(userId);
+  async function pushDirectory(ws) {
+    const dir = await listDirectory();
+    // mark online
+    const onlineIds = new Set(onlineByUserId.keys());
+    const users = dir.users.map(u => safeUserPublic(u, onlineIds.has(u.id)));
+    send(ws, { type: "directory", users, channels: dir.channels });
+  }
 
-    try { await db.execute("UPDATE users SET lastSeen=NOW() WHERE userId=?", [userId]); } catch {}
+  async function sendHistory(ws, peerUsername, limit=100) {
+    const me = ws.user;
+    if (!me) return;
+    const peer = await getUserByUsername(normUser(peerUsername));
+    if (!peer) {
+      send(ws, { type: "history", with: normUser(peerUsername), messages: [] });
+      return;
+    }
+    const rows = await q(
+      `SELECT m.id, m.sender_user_id, su.username AS sender, m.receiver_user_id, ru.username AS receiver,
+              m.channel_id, m.type, m.content, m.file_url, m.created_at
+       FROM messages m
+       LEFT JOIN users su ON su.id=m.sender_user_id
+       LEFT JOIN users ru ON ru.id=m.receiver_user_id
+       WHERE (m.sender_user_id=? AND m.receiver_user_id=?)
+          OR (m.sender_user_id=? AND m.receiver_user_id=?)
+       ORDER BY m.id DESC
+       LIMIT ?`,
+      [me.id, peer.id, peer.id, me.id, limit]
+    );
+    const msgs = rows.reverse().map(r => ({
+      id: r.id,
+      from: r.sender,
+      to: r.receiver,
+      type: r.type,
+      text: r.content,
+      fileUrl: r.file_url,
+      at: r.created_at,
+    }));
+    send(ws, { type: "history", with: peer.username, messages: msgs });
+  }
 
-    broadcast({ type: "user_offline", userId }, userId);
+  wss.on("connection", (ws) => {
+    clients.add(ws);
+    ws.user = null;      // user row
+    ws.username = null;  // string
+    ws.isAdmin = false;
+
+    send(ws, { type: "hello", serverTime: Date.now() });
+
+    ws.on("message", async (buf) => {
+      let data;
+      try { data = JSON.parse(buf.toString("utf8")); } catch { return; }
+
+      try {
+        // --- AUTH ---
+        if (data.type === "resume") {
+          const token = String(data.token || "");
+          const u = await getUserByToken(token);
+          if (!u) {
+            send(ws, { type: "auth", ok: false, error: "bad_token" });
+            return;
+          }
+          // check ban
+          const ban = await activeBan(u.id);
+          if (ban) {
+            wsCloseWithBan(ws, ban.reason, ban.expires_at ? ban.expires_at.toISOString?.() : ban.expires_at);
+            return;
+          }
+
+          ws.user = u;
+          ws.username = u.username;
+          ws.isAdmin = ADMIN_USERS.has(u.username);
+
+          onlineByUserId.set(u.id, ws);
+          send(ws, { type: "auth", ok: true, username: u.username, token, user: safeUserPublic(u, true), admin: ws.isAdmin });
+          broadcast(clients, { type: "presence", user: u.username, online: true }, ws);
+          await pushDirectory(ws);
+          return;
+        }
+
+        if (data.type === "register") {
+          const username = normUser(data.username);
+          const password = String(data.password || "");
+          const email = String(data.email || "").trim() || null;
+          const emailPublic = !!data.emailPublic;
+
+          if (!username || username.length < 3) {
+            send(ws, { type: "auth", ok: false, error: "bad_username" });
+            return;
+          }
+          if (!password || password.length < 4) {
+            send(ws, { type: "auth", ok: false, error: "bad_password" });
+            return;
+          }
+          const exists = await getUserByUsername(username);
+          if (exists) {
+            send(ws, { type: "auth", ok: false, error: "user_exists" });
+            return;
+          }
+
+          const passHash = sha256(password);
+          const [result] = await pool.execute(
+            "INSERT INTO users (username, display_name, pass_hash, email, email_public) VALUES (?, ?, ?, ?, ?)",
+            [username, username, passHash, email, emailPublic ? 1 : 0]
+          );
+
+          const userId = result.insertId;
+          const u = await q("SELECT * FROM users WHERE id=?", [userId]).then(r => r[0]);
+          const ban = await activeBan(u.id);
+          if (ban) {
+            wsCloseWithBan(ws, ban.reason, ban.expires_at);
+            return;
+          }
+
+          const token = await createSession(userId);
+          ws.user = u;
+          ws.username = u.username;
+          ws.isAdmin = ADMIN_USERS.has(u.username);
+          onlineByUserId.set(u.id, ws);
+
+          send(ws, { type: "auth", ok: true, username: u.username, token, user: safeUserPublic(u, true), admin: ws.isAdmin });
+          broadcast(clients, { type: "presence", user: u.username, online: true }, ws);
+          await pushDirectory(ws);
+          return;
+        }
+
+        if (data.type === "login") {
+          const username = normUser(data.username);
+          const password = String(data.password || "");
+          const u = await getUserByUsername(username);
+          if (!u || u.pass_hash !== sha256(password)) {
+            send(ws, { type: "auth", ok: false, error: "bad_credentials" });
+            return;
+          }
+
+          const ban = await activeBan(u.id);
+          if (ban) {
+            wsCloseWithBan(ws, ban.reason, ban.expires_at);
+            return;
+          }
+
+          // create new session
+          const token = await createSession(u.id);
+
+          ws.user = u;
+          ws.username = u.username;
+          ws.isAdmin = ADMIN_USERS.has(u.username);
+          onlineByUserId.set(u.id, ws);
+
+          send(ws, { type: "auth", ok: true, username: u.username, token, user: safeUserPublic(u, true), admin: ws.isAdmin });
+          broadcast(clients, { type: "presence", user: u.username, online: true }, ws);
+          await pushDirectory(ws);
+          return;
+        }
+
+        // must be authed beyond this point
+        if (!ws.user) {
+          send(ws, { type: "error", error: "not_authed" });
+          return;
+        }
+
+        // --- DIRECTORY / HISTORY ---
+        if (data.type === "get_directory") {
+          await pushDirectory(ws);
+          return;
+        }
+        if (data.type === "get_history") {
+          await sendHistory(ws, data.with, Math.max(1, Math.min(500, parseInt(data.limit || 150, 10))));
+          return;
+        }
+
+        // --- PROFILE ---
+        if (data.type === "get_profile") {
+          const target = await getUserByUsername(normUser(data.username));
+          if (!target) { send(ws, { type: "profile", ok: false }); return; }
+          const online = onlineByUserId.has(target.id);
+          send(ws, { type: "profile", ok: true, user: safeUserPublic(target, online) });
+          return;
+        }
+
+        // --- SETTINGS ---
+        if (data.type === "set_email_public") {
+          const val = !!data.value;
+          await q("UPDATE users SET email_public=? WHERE id=?", [val ? 1 : 0, ws.user.id]);
+          ws.user.email_public = val ? 1 : 0;
+          send(ws, { type: "ok", op: "set_email_public", value: val });
+          await pushDirectory(ws);
+          return;
+        }
+
+        if (data.type === "set_avatar") {
+          const url = String(data.url || "").trim();
+          await q("UPDATE users SET avatar_url=? WHERE id=?", [url || null, ws.user.id]);
+          ws.user.avatar_url = url || null;
+          send(ws, { type: "ok", op: "set_avatar", url: ws.user.avatar_url });
+          await pushDirectory(ws);
+          return;
+        }
+
+        // --- CHANNELS ---
+        if (data.type === "create_channel") {
+          const name = String(data.name || "").trim();
+          if (!name || name.length < 2) { send(ws, { type: "error", error: "bad_channel_name" }); return; }
+          await q("INSERT INTO channels (name, owner_user_id) VALUES (?, ?)", [name, ws.user.id]);
+          await pushDirectory(ws);
+          return;
+        }
+
+        // --- MESSAGES ---
+        if (data.type === "message") {
+          const muted = await isMuted(ws.user.id);
+          if (muted) {
+            send(ws, { type: "muted", reason: muted.reason || "muted", until: muted.expires_at });
+            return;
+          }
+
+          const to = normUser(data.to);
+          const text = String(data.text || "").slice(0, 5000);
+          const msgType = String(data.msgType || "text"); // text | voice
+          const fileUrl = data.fileUrl ? String(data.fileUrl) : null;
+
+          const peer = await getUserByUsername(to);
+          if (!peer) { send(ws, { type: "error", error: "user_not_found" }); return; }
+
+          const [res] = await pool.execute(
+            "INSERT INTO messages (sender_user_id, receiver_user_id, type, content, file_url) VALUES (?, ?, ?, ?, ?)",
+            [ws.user.id, peer.id, msgType, text, fileUrl]
+          );
+
+          const payload = {
+            type: "message",
+            id: res.insertId,
+            from: ws.user.username,
+            to: peer.username,
+            msgType,
+            text,
+            fileUrl,
+            at: new Date().toISOString(),
+          };
+
+          // send to both (if online)
+          send(ws, payload);
+          const peerWs = onlineByUserId.get(peer.id);
+          if (peerWs && peerWs.readyState === 1) send(peerWs, payload);
+          return;
+        }
+
+        // --- ADMIN ---
+        if (data.type === "admin" && ws.isAdmin) {
+          const action = String(data.action || "");
+          const targetUser = normUser(data.username);
+
+          if (action === "mute" || action === "ban") {
+            const target = await getUserByUsername(targetUser);
+            if (!target) { send(ws, { type: "error", error: "user_not_found" }); return; }
+            const minutes = data.minutes == null ? null : Math.max(1, Math.min(60*24*365, parseInt(data.minutes, 10)));
+            const reason = String(data.reason || "").slice(0, 250) || action;
+            const expiresAt = minutes ? new Date(Date.now() + minutes*60*1000) : null;
+
+            await q(
+              "INSERT INTO sanctions (user_id, type, reason, expires_at, created_by) VALUES (?, ?, ?, ?, ?)",
+              [target.id, action, reason, expiresAt, ws.user.id]
+            );
+
+            send(ws, { type: "ok", op: action, username: target.username });
+
+            const targetWs = onlineByUserId.get(target.id);
+            if (targetWs) {
+              if (action === "mute") {
+                send(targetWs, { type: "muted", reason, until: expiresAt });
+              } else {
+                wsCloseWithBan(targetWs, reason, expiresAt ? expiresAt.toISOString() : null);
+              }
+            }
+            return;
+          }
+
+          if (action === "unmute" || action === "unban") {
+            const t = await getUserByUsername(targetUser);
+            if (!t) { send(ws, { type: "error", error: "user_not_found" }); return; }
+            const type = action === "unmute" ? "mute" : "ban";
+            await q("UPDATE sanctions SET expires_at=NOW() WHERE user_id=? AND type=? AND (expires_at IS NULL OR expires_at > NOW())", [t.id, type]);
+            send(ws, { type: "ok", op: action, username: t.username });
+            return;
+          }
+
+          if (action === "set_prefix") {
+            const t = await getUserByUsername(targetUser);
+            if (!t) { send(ws, { type: "error", error: "user_not_found" }); return; }
+            const prefix = String(data.prefix || "").slice(0, 24);
+            await q("UPDATE users SET prefix=? WHERE id=?", [prefix, t.id]);
+            send(ws, { type: "ok", op: "set_prefix", username: t.username, prefix });
+            await pushDirectory(ws);
+            broadcast(clients, { type: "directory_changed" });
+            return;
+          }
+
+          if (action === "clear_db") {
+            await q("DELETE FROM messages");
+            await q("DELETE FROM channels");
+            await q("DELETE FROM sanctions");
+            // keep users + sessions
+            send(ws, { type: "ok", op: "clear_db" });
+            broadcast(clients, { type: "directory_changed" });
+            return;
+          }
+
+          send(ws, { type: "error", error: "unknown_admin_action" });
+          return;
+        }
+
+      } catch (e) {
+        console.error("WS handler error:", e);
+        send(ws, { type: "error", error: "server_error" });
+      }
+    });
+
+    ws.on("close", () => {
+      clients.delete(ws);
+      if (ws.user) {
+        onlineByUserId.delete(ws.user.id);
+        broadcast(clients, { type: "presence", user: ws.user.username, online: false });
+      }
+    });
   });
+
+  server.listen(PORT, () => {
+    console.log(`HTTP/WS listening on :${PORT}`);
+  });
+}
+
+main().catch((e) => {
+  console.error("Fatal:", e);
+  process.exit(1);
 });
-
-initDB()
-  .then(() => {
-    server.listen(PORT, "0.0.0.0", () => console.log("Server running on port", PORT));
-  })
-  .catch((e) => {
-    console.error("DB init failed:", e.message);
-    process.exit(1);
-  });
