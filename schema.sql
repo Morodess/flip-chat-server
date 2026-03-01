@@ -1,56 +1,91 @@
 CREATE TABLE IF NOT EXISTS users (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  username VARCHAR(64) NOT NULL UNIQUE,
-  display_name VARCHAR(128) NULL,
-  pass_hash CHAR(64) NOT NULL,
-  email VARCHAR(190) NULL,
-  email_public TINYINT(1) NOT NULL DEFAULT 0,
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  username VARCHAR(32) NOT NULL UNIQUE,
+  email VARCHAR(255) NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  prefix VARCHAR(32) NULL DEFAULT NULL,
+  can_show_email TINYINT(1) NOT NULL DEFAULT 0,
   avatar_url TEXT NULL,
-  prefix VARCHAR(24) NOT NULL DEFAULT '',
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS sessions (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  token CHAR(36) NOT NULL,
   user_id BIGINT UNSIGNED NOT NULL,
-  token CHAR(64) NOT NULL UNIQUE,
-  expires_at TIMESTAMP NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  KEY idx_sessions_user (user_id),
+  expires_at TIMESTAMP NOT NULL,
+  PRIMARY KEY (token),
+  KEY idx_sessions_user_id (user_id),
   CONSTRAINT fk_sessions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS channels (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  name VARCHAR(128) NOT NULL UNIQUE,
-  owner_user_id BIGINT UNSIGNED NOT NULL,
+CREATE TABLE IF NOT EXISTS bans (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id BIGINT UNSIGNED NOT NULL,
+  reason TEXT NOT NULL,
+  banned_until TIMESTAMP NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT fk_channels_owner FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE CASCADE
+  PRIMARY KEY (id),
+  KEY idx_bans_user_id (user_id),
+  CONSTRAINT fk_bans_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS mutes (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id BIGINT UNSIGNED NOT NULL,
+  reason TEXT NOT NULL,
+  muted_until TIMESTAMP NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_mutes_user_id (user_id),
+  CONSTRAINT fk_mutes_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS channels (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  name VARCHAR(64) NOT NULL,
+  owner_id BIGINT UNSIGNED NOT NULL,
+  is_private TINYINT(1) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_channels_name (name),
+  KEY idx_channels_owner (owner_id),
+  CONSTRAINT fk_channels_owner FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS channel_members (
+  channel_id BIGINT UNSIGNED NOT NULL,
+  user_id BIGINT UNSIGNED NOT NULL,
+  role ENUM('member','admin','owner') NOT NULL DEFAULT 'member',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (channel_id, user_id),
+  KEY idx_cm_user (user_id),
+  CONSTRAINT fk_cm_channel FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+  CONSTRAINT fk_cm_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS messages (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  sender_user_id BIGINT UNSIGNED NOT NULL,
-  receiver_user_id BIGINT UNSIGNED NULL,
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  sender_id BIGINT UNSIGNED NOT NULL,
+  dm_key VARCHAR(128) NULL,
   channel_id BIGINT UNSIGNED NULL,
-  type VARCHAR(16) NOT NULL DEFAULT 'text', -- text | voice
-  content TEXT NULL,
-  file_url TEXT NULL,
+  kind ENUM('text','voice','system') NOT NULL DEFAULT 'text',
+  body LONGTEXT NULL,
+  attachment_url TEXT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  KEY idx_msg_pair (sender_user_id, receiver_user_id, id),
-  KEY idx_msg_receiver (receiver_user_id, id),
-  CONSTRAINT fk_msg_sender FOREIGN KEY (sender_user_id) REFERENCES users(id) ON DELETE CASCADE,
-  CONSTRAINT fk_msg_receiver FOREIGN KEY (receiver_user_id) REFERENCES users(id) ON DELETE CASCADE
+  PRIMARY KEY (id),
+  KEY idx_messages_dm (dm_key, created_at),
+  KEY idx_messages_channel (channel_id, created_at),
+  CONSTRAINT fk_messages_sender FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT fk_messages_channel FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE IF NOT EXISTS sanctions (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS presence (
   user_id BIGINT UNSIGNED NOT NULL,
-  type VARCHAR(16) NOT NULL, -- mute | ban
-  reason VARCHAR(250) NULL,
-  expires_at TIMESTAMP NULL,
-  created_by BIGINT UNSIGNED NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  KEY idx_sanctions_active (user_id, type, expires_at),
-  CONSTRAINT fk_sanctions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  is_online TINYINT(1) NOT NULL DEFAULT 0,
+  last_seen TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id),
+  CONSTRAINT fk_presence_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
